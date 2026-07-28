@@ -612,6 +612,23 @@ type streamConn struct {
 	used0RTT bool
 }
 
+// Close implements the [net.Conn] contract: it terminates BOTH directions —
+// the send side with a clean FIN, the receive side with CancelRead. Reads
+// must fail after a net.Conn Close anyway, and leaving the receive half
+// open pins the stream forever whenever the peer's FIN arrives after this
+// side's last Read (with any real network latency, that is the common case
+// for request/response protocols: the reader consumes the final frame the
+// instant it lands and never reads again, the FIN lands one flight later
+// unread, the stream never completes, and its MAX_STREAMS credit is never
+// returned — the peer then starves at exactly the initial stream budget).
+// The raw [Stream] keeps fine-grained QUIC semantics; only the net.Conn
+// view gets net.Conn behavior.
+func (c streamConn) Close() error {
+	err := c.Stream.Close()
+	c.Stream.CancelRead(0)
+	return err
+}
+
 func (c streamConn) LocalAddr() net.Addr { return c.local }
 
 func (c streamConn) RemoteAddr() net.Addr { return c.remote }
