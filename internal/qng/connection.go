@@ -1101,8 +1101,11 @@ func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
 	if params := c.peerParams.Load(); params.MaxUDPPayloadSize > 0 && params.MaxUDPPayloadSize < maxPacketSize {
 		maxPacketSize = params.MaxUDPPayloadSize
 	}
-	c.mtuDiscoverer.Reset(now, initialPacketSize, maxPacketSize)
 	c.conn = newSendConn(tr.conn, c.conn.RemoteAddr(), packetInfo{}, utils.DefaultLogger) // TODO: find a better way
+	// After the swap, so the gate reads the socket that will carry the probes:
+	// the new Transport's socket has its own DF capability. Reset only touches
+	// mtuFinder state, so moving it past the swap changes nothing else.
+	c.resetMTUDiscoverer(now, initialPacketSize, maxPacketSize)
 	c.sendQueue.Close()
 	c.sendQueue = newSendQueue(c.conn)
 	go func() {
@@ -1158,6 +1161,27 @@ func (c *Conn) handleHandshakeComplete(now monotime.Time) error {
 	c.queueControlFrame(&wire.NewTokenFrame{Token: token})
 	c.queueControlFrame(&wire.HandshakeDoneFrame{})
 	return nil
+}
+
+// resetMTUDiscoverer forgets what path MTU discovery learned about the old path
+// and re-arms the prober only if discovery is permitted on the current send
+// conn. Every migration must forget: an estimate probed on the old path may be
+// too large for the new one, and nothing lowers it again. Re-arming is the part
+// that needs the gate, because mtuFinder.Reset arms the prober by itself --
+// ShouldSendProbe needs nothing but a non-zero lastProbeTime -- so a plain Reset
+// starts discovery that handleHandshakeConfirmed deliberately never started.
+//
+// Callers must have installed the send conn that will carry the probes before
+// calling this.
+//
+// quic-go's own mtuFinder.Reset checks neither condition, so all four migration
+// paths need this locally. Reported upstream; if it is fixed there, these calls
+// can go back to Reset at the next revendor.
+func (c *Conn) resetMTUDiscoverer(now monotime.Time, start, max protocol.ByteCount) {
+	c.mtuDiscoverer.Reset(now, start, max)
+	if c.config.DisablePathMTUDiscovery || !c.conn.capabilities().DF {
+		c.mtuDiscoverer.lastProbeTime = 0
+	}
 }
 
 func (c *Conn) handleHandshakeConfirmed(now monotime.Time) error {
@@ -1589,7 +1613,7 @@ func (c *Conn) handleShortHeaderPacket(
 	if params := c.peerParams.Load(); params.MaxUDPPayloadSize > 0 && params.MaxUDPPayloadSize < maxPacketSize {
 		maxPacketSize = params.MaxUDPPayloadSize
 	}
-	c.mtuDiscoverer.Reset(
+	c.resetMTUDiscoverer(
 		p.rcvTime,
 		protocol.ByteCount(c.config.InitialPacketSize),
 		maxPacketSize,

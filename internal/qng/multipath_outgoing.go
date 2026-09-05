@@ -512,7 +512,7 @@ func (c *Conn) migrateOrdinarySendToQNTRoute(route netip.AddrPort, now monotime.
 	}
 	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
 	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
-	c.mtuDiscoverer.Reset(now, initialPacketSize, maxPacketSize)
+	c.resetMTUDiscoverer(now, initialPacketSize, maxPacketSize)
 	if c.multipathOut != nil && c.multipathOut.premigrationRemote == nil {
 		c.multipathOut.premigrationRemote = c.conn.RemoteAddr()
 	}
@@ -568,7 +568,7 @@ func (c *Conn) revertQNTMigration(now monotime.Time) {
 	}
 	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
 	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
-	c.mtuDiscoverer.Reset(now, initialPacketSize, maxPacketSize)
+	c.resetMTUDiscoverer(now, initialPacketSize, maxPacketSize)
 	c.conn.ChangeRemoteAddr(m.premigrationRemote, packetInfo{})
 	m.revertedRoute = m.migratedRemote
 	m.revertedRouteUntil = now.Add(qntRemigrationCooldown)
