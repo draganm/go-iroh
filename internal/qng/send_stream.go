@@ -73,6 +73,14 @@ type SendStream struct {
 	// has not yet drained it. It lets the buffered write path skip a redundant
 	// onHasStreamData for every write in a burst.
 	active bool
+	// Burst activation state. See send_stream_burst.go: a stream drained in
+	// the middle of a burst corks the next write briefly so the writes behind
+	// it can fill a packet.
+	writesInEpisode uint16
+	burstUntil      monotime.Time
+	corkPending     bool
+	activationTimer *time.Timer
+	activationGen   uint64
 
 	supportsResetStreamAt bool
 	finishedWriting       bool // set once Close() is called
@@ -264,10 +272,13 @@ func (s *SendStream) write(p []byte, limiter func(int) int) (bool /* is newly co
 	// stream.
 	if limiter == nil && s.deadline.IsZero() && len(p) <= maxBufferedWriteSize && s.growWriteBufferFor(len(p)) {
 		s.appendWriteBuffer(p)
+		s.noteBufferedWriteLocked()
 		if s.active {
 			return false, len(p), nil
 		}
-		s.active = true
+		if !s.activateOrDelayLocked() {
+			return false, len(p), nil
+		}
 		s.mutex.Unlock()
 		s.sender.onHasStreamData(s.streamID, s) // must be called without holding the mutex
 		s.mutex.Lock()
@@ -415,7 +426,7 @@ func (s *SendStream) popStreamFrame(maxBytes protocol.ByteCount, v protocol.Vers
 	// The sender drops the stream when there is no more data, so the next
 	// write has to notify it again.
 	if !hasMoreData {
-		s.active = false
+		s.endEpisodeLocked()
 	}
 	s.mutex.Unlock()
 
@@ -658,6 +669,9 @@ func (s *SendStream) Close() error {
 		return nil
 	}
 	s.finishedWriting = true
+	// The FIN is sent unconditionally below, so a pending cork would only
+	// produce a stray wakeup after the stream is closed.
+	s.uncorkLocked()
 	cancelled := s.resetErr != nil
 	if cancelled {
 		s.cancellationFlagged = true
@@ -690,6 +704,7 @@ func (s *SendStream) SetReliableBoundary() {
 
 // returnFramesToPool returns all queued frames to the sync.Pool
 func (s *SendStream) returnFramesToPool() {
+	s.uncorkLocked()
 	for _, f := range s.retransmissionQueue {
 		f.PutBack()
 	}
@@ -802,6 +817,7 @@ func (s *SendStream) updateSendWindow(limit protocol.ByteCount) {
 	}
 	hasStreamData := s.dataForWriting != nil || s.nextFrame != nil || s.bufferedWriteLen() > 0
 	if hasStreamData {
+		s.uncorkLocked()
 		s.active = true
 	}
 	s.mutex.Unlock()
@@ -818,6 +834,7 @@ func (s *SendStream) onConnectionSendWindowUpdated() {
 	s.mutex.Lock()
 	hasStreamData := s.dataForWriting != nil || s.nextFrame != nil || s.bufferedWriteLen() > 0
 	if hasStreamData {
+		s.uncorkLocked()
 		s.active = true
 	}
 	s.mutex.Unlock()
