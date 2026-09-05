@@ -148,7 +148,46 @@ func (s *SendStream) Write(p []byte) (int, error) {
 // limiter can run multiple times on another goroutine while QUIC send flow-control accounting
 // is locked. It must be concurrency-safe and must not block or call QUIC methods.
 // A nil limiter behaves like [SendStream.Write].
+// writeFast handles the steady state of a stream being written in pieces
+// small enough to buffer: copy under the mutex and return. It reports whether
+// it took the write.
+//
+// go-iroh addition. The general path signals writeOnce and defers a receive on
+// it before it takes the mutex at all, so every write pays a channel round trip
+// on top of the lock it needs anyway. That is a fixed cost per Write call, so
+// it is charged in proportion to how small the writes are: invisible at 8 KiB,
+// and a large share of the budget at 32 bytes.
+//
+// The conditions are what makes skipping writeOnce safe. dataForWriting == nil
+// means no blocking write is parked with older bytes queued, which is the case
+// that matters: the drain order is nextFrame, write buffer, dataForWriting, so
+// buffering newer bytes ahead of a blocked write's older ones would hand two
+// ranges the same offset. active means the sender has already been told about
+// this stream, so taking the write here cannot swallow a wakeup. Anything else
+// -- a deadline, a limiter, a shutdown, a full buffer -- falls through to the
+// general path unchanged.
+func (s *SendStream) writeFast(p []byte, limiter func(maxBytes int) int) bool {
+	if limiter != nil || len(p) == 0 || len(p) > maxBufferedWriteSize {
+		return false
+	}
+	s.mutex.Lock()
+	if !s.active || s.dataForWriting != nil || s.writeLimited ||
+		s.resetErr != nil || s.shutdownErr != nil || s.finishedWriting ||
+		!s.deadline.IsZero() || !s.growWriteBufferFor(len(p)) {
+		s.mutex.Unlock()
+		return false
+	}
+	s.appendWriteBuffer(p)
+	s.noteBufferedWriteLocked()
+	s.mutex.Unlock()
+	return true
+}
+
 func (s *SendStream) WriteWithLimit(p []byte, limiter func(maxBytes int) int) (int, error) {
+	if s.writeFast(p, limiter) {
+		return len(p), nil
+	}
+
 	// Concurrent use of Write is not permitted (and doesn't make any sense),
 	// but sometimes people do it anyway.
 	// Make sure that we only execute one call at any given time to avoid hard to debug failures.
