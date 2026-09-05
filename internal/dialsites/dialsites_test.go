@@ -50,6 +50,15 @@ func TestDialSitesAreListed(t *testing.T) {
 			if n := d.Name(); n == ".git" || n == "testdata" || n == "vendor" {
 				return filepath.SkipDir
 			}
+			// A directory holding its own .git is a nested checkout, such as
+			// a linked worktree or a vendored clone, not this module's
+			// source. The entry is a directory in a clone and a file in a
+			// linked worktree, so match either.
+			if path != root {
+				if _, err := os.Lstat(filepath.Join(path, ".git")); err == nil {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
