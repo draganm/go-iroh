@@ -677,10 +677,18 @@ type rustTransferProvider struct {
 	cmd     *exec.Cmd
 	done    chan error
 	out     *rustTransferOutput
+	grace   time.Duration
 	once    sync.Once
 	waitErr error
 }
 
+// Close interrupts the provider and waits for it to exit. Exit is an event, so
+// the wait is not bounded by a guess at how long a healthy provider takes to
+// notice the interrupt: a loaded machine can stretch that from milliseconds to
+// seconds. The grace period is only a backstop against a provider that ignores
+// the interrupt entirely, and is denominated against the test binary's own
+// deadline; after a kill the process is certain to be reaped, so that wait has
+// no bound at all.
 func (p *rustTransferProvider) Close() error {
 	p.once.Do(func() {
 		var signalErr error
@@ -689,6 +697,12 @@ func (p *rustTransferProvider) Close() error {
 				signalErr = err
 			}
 		}
+		grace := p.grace
+		if grace <= 0 {
+			grace = time.Minute
+		}
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
 		select {
 		case err := <-p.done:
 			if err != nil {
@@ -696,22 +710,30 @@ func (p *rustTransferProvider) Close() error {
 			} else if signalErr != nil {
 				p.waitErr = fmt.Errorf("%s interrupt: %w", p.cmd.Path, signalErr)
 			}
-		case <-time.After(5 * time.Second):
+		case <-timer.C:
 			if p.cmd.Process != nil {
 				_ = p.cmd.Process.Kill()
 			}
-			select {
-			case p.waitErr = <-p.done:
-			case <-time.After(time.Second):
-				p.waitErr = fmt.Errorf("%s did not stop after interrupt", p.cmd.Path)
-				return
-			}
-			if p.waitErr == nil {
-				p.waitErr = fmt.Errorf("%s did not stop after interrupt", p.cmd.Path)
-			}
+			err := <-p.done
+			p.waitErr = fmt.Errorf("%s did not exit within %v of an interrupt; killed it, which reported %v", p.cmd.Path, grace, err)
 		}
 	})
 	return p.waitErr
+}
+
+// rustTransferStopGrace reports how long Close may wait for an interrupted
+// provider before killing it. It runs until shortly before the test binary
+// would time out, so a slow shutdown fails the test only when it is genuinely
+// wedged rather than merely descheduled.
+func rustTransferStopGrace(t *testing.T) time.Duration {
+	deadline, ok := t.Deadline()
+	if !ok {
+		return time.Minute
+	}
+	if d := time.Until(deadline) - 30*time.Second; d > time.Second {
+		return d
+	}
+	return time.Second
 }
 
 func (p *rustTransferProvider) Output() string {
@@ -795,6 +817,7 @@ func startRustTransferProvider(t *testing.T, bin string) (*rustTransferProvider,
 		cmd:     cmd,
 		done:    done,
 		out:     out,
+		grace:   rustTransferStopGrace(t),
 	}
 
 	timer := time.NewTimer(30 * time.Second)
