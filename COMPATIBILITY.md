@@ -131,8 +131,9 @@ file.
 
 ### v0.2.0
 
-One option added, one deprecated, one wire change, and a vendored upstream
-bump. Nothing was removed and no exported signature changed.
+One option added, one deprecated, four behaviour changes, one concurrency
+contract tightened, and a vendored upstream bump. Nothing was removed and no
+exported signature changed.
 
 net_report now runs by default whenever relays are configured. It measures
 relay latency and reports the QAD-derived global addresses advertised as local
