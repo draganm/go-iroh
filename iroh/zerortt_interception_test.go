@@ -399,8 +399,14 @@ func TestConnectEarlyUnreachableFirstTarget(t *testing.T) {
 	}
 	conn1, _ := c1.Into0RTT()
 	echo(t, ctx, conn1, "cold")
-	if !waitFor(ctx, func() bool { return client.sessionCache.Len() > 0 }) {
-		t.Fatalf("client never cached a session ticket: %v", ctx.Err())
+	// The ticket and the dial hint are recorded independently: the hint lands
+	// in a goroutine registerConn starts, so waiting only for the ticket can
+	// leave the next dial with no proven target. Wait for both.
+	if !waitFor(ctx, func() bool {
+		_, proven := client.goodTarget(server.ID())
+		return client.sessionCache.Len() > 0 && proven
+	}) {
+		t.Fatalf("client never cached a session ticket and a dial hint: %v", ctx.Err())
 	}
 	conn1.CloseWithError(0, "")
 
@@ -457,8 +463,14 @@ func TestConnectEarlyFallsThroughUnprovenTarget(t *testing.T) {
 	}
 	conn1, _ := c1.Into0RTT()
 	echo(t, ctx, conn1, "cold")
-	if !waitFor(ctx, func() bool { return client.sessionCache.Len() > 0 }) {
-		t.Fatalf("client never cached a session ticket: %v", ctx.Err())
+	// forgetRemote below only drops a hint that is already recorded, so wait
+	// for it as well as for the ticket; a hint landing afterwards would make
+	// the next dial promote a proven target and skip the fall-through.
+	if !waitFor(ctx, func() bool {
+		_, proven := client.goodTarget(server.ID())
+		return client.sessionCache.Len() > 0 && proven
+	}) {
+		t.Fatalf("client never cached a session ticket and a dial hint: %v", ctx.Err())
 	}
 	conn1.CloseWithError(0, "")
 
