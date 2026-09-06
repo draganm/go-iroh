@@ -1,6 +1,7 @@
 package quic
 
 import (
+	"math/bits"
 	"slices"
 	"sync"
 
@@ -63,6 +64,14 @@ type framer struct {
 	// New losses extend its batch, so A, B, A is repaired as A, A, B, delaying B.
 	// The ring buffer provides FIFO scheduling while reusing its storage.
 	retransmissionQueue [8]ringbuffer.RingBuffer[protocol.StreamID]
+
+	// streamMask and retransMask hold a bit per urgency level whose queues may
+	// be non-empty, so Append scans only the levels in use instead of all 8.
+	// A set bit is a hint: bits are set when queueing and cleared only after
+	// the level is observed empty under mutex, so a clear bit always means
+	// empty and no stream can be missed.
+	streamMask  uint8
+	retransMask uint8
 
 	controlFrameMutex          sync.Mutex
 	controlFrames              []wire.Frame
@@ -154,7 +163,9 @@ func (f *framer) Append(
 	f.mutex.Lock()
 	// retransmit all lost STREAM data before sending new STREAM data
 retransmissions:
-	for urgency := range f.retransmissionQueue {
+	for m := f.retransMask; m != 0; {
+		urgency := bits.TrailingZeros8(m)
+		m &^= 1 << uint(urgency)
 		bucket := &f.retransmissionQueue[urgency]
 		for !bucket.Empty() && protocol.MinStreamFrameSize <= maxLen {
 			id := bucket.PeekFront()
@@ -167,6 +178,12 @@ retransmissions:
 			if currentUrgency != int8(urgency) {
 				bucket.PopFront()
 				f.retransmissionQueue[currentUrgency].PushBack(id)
+				f.retransMask |= 1 << uint(currentUrgency)
+				// Reach a higher level later in this same pass, as a scan
+				// over every level would have.
+				if int(currentUrgency) > urgency {
+					m |= 1 << uint(currentUrgency)
+				}
 				continue
 			}
 			// For the last STREAM frame, we'll remove the DataLen field later.
@@ -188,9 +205,14 @@ retransmissions:
 			lastFrame = sf
 			streamFrameLen += sf.Frame.Length(v)
 		}
+		if bucket.Empty() {
+			f.retransMask &^= 1 << uint(urgency)
+		}
 	}
 	// pop STREAM frames, until less than 128 bytes are left in the packet
-	for urgency := range f.incrementalStreams {
+	for m := f.streamMask; m != 0; {
+		urgency := bits.TrailingZeros8(m)
+		m &^= 1 << uint(urgency)
 		numActiveStreams := f.incrementalStreams[urgency].Len() + f.nonIncrementalStreams[urgency].Len()
 
 		for range numActiveStreams {
@@ -231,6 +253,9 @@ retransmissions:
 				maxLen -= l
 				controlFrameLen += l
 			}
+		}
+		if f.incrementalStreams[urgency].Empty() && f.nonIncrementalStreams[urgency].Empty() {
+			f.streamMask &^= 1 << uint(urgency)
 		}
 	}
 
@@ -364,6 +389,7 @@ func (f *framer) AddActiveStream(id protocol.StreamID, str streamFrameGetter) {
 	} else {
 		f.nonIncrementalStreams[urgency].Push(id, generation)
 	}
+	f.streamMask |= 1 << uint(urgency)
 	f.activeStreams[id] = queuedStream{streamFrameGetter: str, generation: generation}
 }
 
@@ -376,6 +402,7 @@ func (f *framer) AddStreamWithRetransmission(id protocol.StreamID, str streamFra
 		return
 	}
 	f.retransmissionQueue[urgency].PushBack(id)
+	f.retransMask |= 1 << uint(urgency)
 	f.retransmissionStreams[id] = str
 }
 
@@ -417,6 +444,7 @@ func (f *framer) UpdateStreamPriority(id protocol.StreamID) {
 		} else {
 			f.nonIncrementalStreams[urgency].Push(id, generation)
 		}
+		f.streamMask |= 1 << uint(urgency)
 		str.generation = generation
 		f.activeStreams[id] = str
 	}
@@ -515,6 +543,8 @@ func (f *framer) Handle0RTTRejection() {
 	f.controlFrameMutex.Lock()
 	defer f.controlFrameMutex.Unlock()
 
+	f.streamMask = 0
+	f.retransMask = 0
 	for urgency := range f.incrementalStreams {
 		f.incrementalStreams[urgency].Clear()
 		f.nonIncrementalStreams[urgency].Clear()
