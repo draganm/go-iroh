@@ -2,6 +2,7 @@ package quic
 
 import (
 	"bytes"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -118,5 +119,89 @@ func TestSendStreamWriteWithLimitRefusalLeavesBufferedBytesSchedulable(t *testin
 	}
 	if err := <-done; err != ErrWriteLimitReached {
 		t.Errorf("WriteWithLimit err = %v, want %v", err, ErrWriteLimitReached)
+	}
+}
+
+// The same over-metering defect through the other staging area: bytes an
+// earlier ordinary Write left in nextFrame are not the limited write's data
+// either. Upstream's `s.nextFrame == nil` term is what stops it, and nothing
+// in this module tests that term.
+func TestSendStreamWriteWithLimitIgnoresStagedBytes(t *testing.T) {
+	str := newSendStream(t.Context(), 0, sendStreamIrohSender{}, testStreamFC(), false)
+
+	// A deadline makes write() skip both buffered paths, so the remainder of a
+	// parked write lands in nextFrame the way it does upstream.
+	str.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	big := bytes.Repeat([]byte("h"), 4000)
+	done := make(chan error, 1)
+	go func() { _, err := str.Write(big); done <- err }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		str.mutex.Lock()
+		staged := str.nextFrame != nil
+		remaining := len(str.dataForWriting)
+		str.mutex.Unlock()
+		if staged {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("the write returned (err=%v) without staging anything in nextFrame", err)
+		default:
+		}
+		// Once the remainder fits a packet the write stages it itself; popping
+		// again would take it back off before it is observed.
+		if remaining > 0 && remaining <= protocol.MaxPacketBufferSize {
+			runtime.Gosched()
+			continue
+		}
+		f, _, _ := str.popStreamFrame(600, protocol.Version1)
+		if f.Frame != nil {
+			f.Frame.PutBack()
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the large write never returned")
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("staging write: %v", err)
+	}
+	str.mutex.Lock()
+	nf := str.nextFrame != nil
+	buffered := str.bufferedWriteLen()
+	str.mutex.Unlock()
+	if !nf || buffered != 0 {
+		t.Fatalf("setup did not reach the state under test: nextFrame staged = %v, buffered = %d bytes, want staged with an empty buffer", nf, buffered)
+	}
+
+	str.SetWriteDeadline(time.Time{})
+	var (
+		mu    sync.Mutex
+		calls []int
+	)
+	limited := make(chan error, 1)
+	go func() {
+		_, err := str.WriteWithLimit(bytes.Repeat([]byte("x"), 40), func(maxBytes int) int {
+			mu.Lock()
+			calls = append(calls, maxBytes)
+			mu.Unlock()
+			return min(maxBytes, 25)
+		})
+		limited <- err
+	}()
+	waitForParkedWrite(t, str)
+
+	f, _, _ := str.popStreamFrame(protocol.MaxPacketBufferSize, protocol.Version1)
+	mu.Lock()
+	seen := append([]int(nil), calls...)
+	mu.Unlock()
+	if f.Frame == nil {
+		t.Fatal("no frame popped")
+	}
+	if !bytes.Equal(f.Frame.Data, bytes.Repeat([]byte("h"), len(f.Frame.Data))) {
+		t.Errorf("frame carried %q, want the earlier write's bytes", f.Frame.Data)
+	}
+	if len(seen) != 0 {
+		t.Errorf("limiter consulted %d times (maxBytes %v) for bytes staged in nextFrame by an earlier Write", len(seen), seen)
 	}
 }
