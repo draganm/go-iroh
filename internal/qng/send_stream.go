@@ -814,6 +814,7 @@ func (s *SendStream) CancelWrite(errorCode StreamErrorCode) {
 	s.ctxCancel(s.resetErr)
 
 	reliableOffset := s.reliableOffset()
+	var hasStreamData bool
 	finalSize := max(s.writeOffset, reliableOffset)
 	if s.nextFrameReserved && s.nextFrame != nil {
 		finalSize = max(finalSize, s.nextFrame.Offset+s.nextFrame.DataLen())
@@ -862,10 +863,27 @@ func (s *SendStream) CancelWrite(errorCode StreamErrorCode) {
 			}
 			s.retransmissionQueue = retransmissionQueue
 		}
+		// The bytes below the boundary still have to reach the peer, so the
+		// sender has to be told they are there. Nothing else will tell it: this
+		// branch deliberately keeps the queued data rather than calling
+		// returnFramesToPool, so it never goes through that function's uncork,
+		// and a cork left pending by an earlier write has stopped being a
+		// wakeup too, because activateAfterDelay bails on the resetErr set
+		// just above. Uncorking is right for the same reason it is in
+		// updateSendWindow: the tail delay exists to batch writes, and no
+		// further write is coming.
+		hasStreamData = s.bufferedWriteLen() > 0 || s.nextFrame != nil || len(s.retransmissionQueue) > 0
+		if hasStreamData {
+			s.uncorkLocked()
+			s.active = true
+		}
 	}
 	s.mutex.Unlock()
 
 	s.signalWrite()
+	if hasStreamData {
+		s.sender.onHasStreamData(s.streamID, s)
+	}
 	s.sender.onHasStreamControlFrame(s.streamID, s)
 }
 

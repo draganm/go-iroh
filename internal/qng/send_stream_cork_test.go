@@ -243,3 +243,48 @@ func TestSendStreamLargeWriteDropsPendingCork(t *testing.T) {
 		}
 	}
 }
+
+// CancelWrite with a reliable boundary keeps sending the bytes below that
+// boundary, so it has to reach the sender. On a corked stream both ways of
+// doing that are gone at once: the branch itself only queues the control
+// frame, and the pending cork timer -- the one wakeup that would otherwise
+// still fire -- bails because CancelWrite has just set resetErr. The reliable
+// bytes are then buffered on a stream the sender does not know about.
+func TestSendStreamCancelWriteWithReliableBoundaryWakesCorkedStream(t *testing.T) {
+	// Keep the cork timer from firing on its own and waking the sender for a
+	// reason this test is not about.
+	defer func(d time.Duration) { sendStreamTailDelay = d }(sendStreamTailDelay)
+	sendStreamTailDelay = time.Minute
+
+	str, sender := newCorkTestStream()
+	str.enableResetStreamAt()
+	for range sendStreamBurstMinWrites {
+		if _, err := str.Write(make([]byte, 32)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	drainOnce(t, str)
+
+	armBurst(str)
+	if _, err := str.Write(make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	str.mutex.Lock()
+	corked := str.corkPending && !str.active
+	str.mutex.Unlock()
+	if !corked {
+		t.Fatal("write was not corked, so the test is not exercising the hazard")
+	}
+
+	str.SetReliableBoundary()
+	before := sender.count()
+	str.CancelWrite(7)
+
+	if got := sender.count(); got == before {
+		f, _, _ := str.popStreamFrame(protocol.MaxPacketBufferSize, protocol.Version1)
+		if f.Frame != nil && f.Frame.DataLen() > 0 {
+			t.Fatalf("sender was not woken, yet the stream still holds %d reliable bytes", f.Frame.DataLen())
+		}
+		t.Fatal("sender was not woken after CancelWrite with a reliable boundary")
+	}
+}
