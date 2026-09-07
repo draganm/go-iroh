@@ -180,3 +180,40 @@ func TestSendStreamOffsetIntegrityUnderConcurrentDrain(t *testing.T) {
 		})
 	}
 }
+
+// TryWriteAll queues into nextFrame, which is drained ahead of the write
+// buffer, so it must refuse rather than queue behind buffered bytes it would
+// then be sent in front of. Write and TryWriteAll are both exported and may be
+// mixed; nothing about the hazard needs concurrency.
+func TestSendStreamTryWriteAllRefusesBehindBufferedWrite(t *testing.T) {
+	sender := &countingStreamSender{ch: make(chan struct{}, 16)}
+	str := newSendStream(t.Context(), 0, sender, testStreamFC(), false)
+
+	if _, err := str.Write([]byte("AAAAAAAA")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := str.TryWriteAll([]byte("BBBBBBBB")); err != ErrWouldBlock {
+		t.Fatalf("TryWriteAll behind a buffered write = %v, want %v", err, ErrWouldBlock)
+	}
+
+	// Refusing must queue nothing, including flow control credit, so the same
+	// write succeeds once the buffer has drained.
+	var frames []popped
+	for range 8 {
+		f, _, more := str.popStreamFrame(protocol.MaxPacketBufferSize, protocol.Version1)
+		if f.Frame != nil && f.Frame.DataLen() > 0 {
+			frames = append(frames, popped{offset: f.Frame.Offset, data: append([]byte(nil), f.Frame.Data...)})
+		}
+		if !more {
+			break
+		}
+	}
+	if err := str.TryWriteAll([]byte("BBBBBBBB")); err != nil {
+		t.Fatalf("TryWriteAll after the drain: %v", err)
+	}
+	f, _, _ := str.popStreamFrame(protocol.MaxPacketBufferSize, protocol.Version1)
+	if f.Frame != nil && f.Frame.DataLen() > 0 {
+		frames = append(frames, popped{offset: f.Frame.Offset, data: append([]byte(nil), f.Frame.Data...)})
+	}
+	checkStreamCoverage(t, frames, []byte("AAAAAAAABBBBBBBB"))
+}

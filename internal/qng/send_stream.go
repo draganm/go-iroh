@@ -191,7 +191,9 @@ func (s *SendStream) WriteWithLimit(p []byte, limiter func(maxBytes int) int) (i
 // calls, which are not permitted, and TryWriteAll probes it without blocking for
 // the same reason; a write taken here is invisible to both. Concurrent writers
 // cannot corrupt the buffer, since every append holds the mutex, but the misuse
-// is no longer reported.
+// is no longer reported. TryWriteAll's ordering does not rest on that probe:
+// tryWriteAll refuses outright while the buffer holds data, so a write taken
+// here can only make it refuse, never make it queue bytes out of order.
 func (s *SendStream) writeFast(p []byte, limiter func(maxBytes int) int) bool {
 	if limiter != nil || len(p) == 0 || len(p) > maxBufferedWriteSize {
 		return false
@@ -247,6 +249,16 @@ func (s *SendStream) tryWriteAll(p []byte) (bool /* is newly completed */, bool 
 	}
 	if len(p) == 0 {
 		return false, false, nil
+	}
+	// nextFrame is drained before the write buffer, so extending it while the
+	// buffer holds data would send bytes queued here at a lower offset than
+	// bytes an earlier Write already buffered. Refuse instead: queueing
+	// nothing is what TryWriteAll promises when it cannot take the whole
+	// slice, and canBufferStreamFrame refuses on the same condition. The
+	// check precedes the flow control reservation so a refusal costs no
+	// credit.
+	if s.bufferedWriteLen() > 0 {
+		return false, false, ErrWouldBlock
 	}
 
 	bytesToReserve := protocol.ByteCount(len(p))
