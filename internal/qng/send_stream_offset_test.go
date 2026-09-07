@@ -64,9 +64,14 @@ func checkStreamCoverage(t *testing.T, frames []popped, want []byte) {
 // The stream must hand the packetizer every byte exactly once, in the right
 // place, while writes and packetization interleave. writeFast takes writes
 // without holding writeOnce, so the guards in it are what keep the buffered
-// bytes, a parked blocking write's bytes and nextFrame in offset order; this
-// checks the resulting byte stream rather than the guards, so it can catch an
-// ordering hazard without being told which one to look for.
+// bytes and a parked blocking write's bytes in offset order; this checks the
+// resulting byte stream rather than the guards, so it can catch an ordering
+// hazard without being told which one to look for.
+//
+// It does not reach nextFrame, the third place a stream can hold data, and no
+// sequence of plain Writes would: see
+// TestSendStreamOffsetOrderStagedFrameAheadOfWriteBuffer for why, and for the
+// interleaving that does reach it.
 func TestSendStreamOffsetIntegrityUnderConcurrentDrain(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -216,4 +221,75 @@ func TestSendStreamTryWriteAllRefusesBehindBufferedWrite(t *testing.T) {
 		frames = append(frames, popped{offset: f.Frame.Offset, data: append([]byte(nil), f.Frame.Data...)})
 	}
 	checkStreamCoverage(t, frames, []byte("AAAAAAAABBBBBBBB"))
+}
+
+// nextFrame is drained ahead of the write buffer, so bytes staged there while
+// the buffer is occupied would go out in front of older bytes. canBufferStreamFrame
+// refuses for exactly that reason, and this is the interleaving that depends on it.
+//
+// Reaching nextFrame at all takes a write deadline. The fork's write buffer
+// added a retry branch ahead of the staging branch in write's loop, and
+// between them the two are mutually exclusive for a plain Write: the retry
+// branch takes anything up to maxBufferedWriteSize (16384), and
+// canBufferStreamFrame caps what it will stage at MaxPacketBufferSize (1452),
+// so a write is always small enough for the first or too large for the second.
+// A deadline is one of the three things that skips the retry branch -- a write
+// limiter and a write buffer too full to grow are the others -- which is what
+// makes upstream's staging path reachable here.
+func TestSendStreamOffsetOrderStagedFrameAheadOfWriteBuffer(t *testing.T) {
+	sender := &countingStreamSender{ch: make(chan struct{}, 16)}
+	str := newSendStream(t.Context(), 0, sender, testStreamFC(), false)
+
+	// Fills the write buffer: no deadline yet, so this takes the retry branch.
+	if _, err := str.Write([]byte("AAAA")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := str.SetWriteDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+
+	// With the retry branch skipped, this write can only be staged into
+	// nextFrame, which it must not be while "AAAA" is still buffered. It parks
+	// until the drain below empties the buffer, then stages at the right offset.
+	done := make(chan error, 1)
+	go func() {
+		_, err := str.Write([]byte("BBBB"))
+		done <- err
+	}()
+
+	// Nothing has been popped, so on correct code this write cannot finish: the
+	// only place left for it is nextFrame, and staging there is refused while
+	// the buffer is occupied. Completing early is the defect itself, and is a
+	// sharper signal than the byte order, which a concurrent drain can hide by
+	// emptying the buffer before the write looks at it.
+	select {
+	case err := <-done:
+		str.mutex.Lock()
+		staged := str.nextFrame
+		str.mutex.Unlock()
+		if err == nil && staged != nil {
+			t.Fatalf("write finished before anything drained, staging %q at offset %d behind %d buffered bytes",
+				staged.Data, staged.Offset, str.bufferedWriteLen())
+		}
+		t.Fatalf("write finished before anything drained: err=%v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	var frames []popped
+	deadline := time.After(10 * time.Second)
+	for len(frames) < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("stream never produced both frames, got %d", len(frames))
+		default:
+		}
+		f, _, _ := str.popStreamFrame(protocol.MaxPacketBufferSize, protocol.Version1)
+		if f.Frame != nil && f.Frame.DataLen() > 0 {
+			frames = append(frames, popped{offset: f.Frame.Offset, data: append([]byte(nil), f.Frame.Data...)})
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("deadline write: %v", err)
+	}
+	checkStreamCoverage(t, frames, []byte("AAAABBBB"))
 }
