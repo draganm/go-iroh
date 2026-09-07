@@ -416,6 +416,14 @@ func (s *SendStream) write(p []byte, limiter func(int) int) (bool /* is newly co
 			}
 		}
 
+		// A write large enough to reach here is being handed to the sender now,
+		// so a cork left pending by an earlier small write is moot. Dropping it
+		// here keeps active true from implying no cork is outstanding: without
+		// this the timer stays armed across the drain, and because
+		// activateOrDelayLocked arms only when the field is nil, the next cork
+		// silently gets no timer of its own. Losing the timer costs nothing
+		// once active is set, since the sender has already been told.
+		s.uncorkLocked()
 		s.active = true
 		s.mutex.Unlock()
 		if !notifiedSender {

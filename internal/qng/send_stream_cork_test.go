@@ -181,3 +181,65 @@ func drainOnce(t *testing.T, str *SendStream) {
 	}
 	t.Fatal("stream never drained")
 }
+
+// A write too large to buffer takes the blocking path, which hands the stream
+// straight to the sender. It must drop a pending cork on the way. Otherwise
+// the timer outlives the episode, and since activateOrDelayLocked arms one
+// only while the field is nil, the next cork gets no timer of its own: its
+// deadline is still the first cork's, so the tail delay it was supposed to
+// wait out is skipped.
+func TestSendStreamLargeWriteDropsPendingCork(t *testing.T) {
+	// A 5us tail delay would fire on its own during the drain below and clear
+	// the field for the wrong reason.
+	defer func(d time.Duration) { sendStreamTailDelay = d }(sendStreamTailDelay)
+	sendStreamTailDelay = time.Minute
+
+	str, _ := newCorkTestStream()
+	corkOnce := func() (gen uint64) {
+		t.Helper()
+		armBurst(str)
+		if _, err := str.Write(make([]byte, 32)); err != nil {
+			t.Fatal(err)
+		}
+		str.mutex.Lock()
+		defer str.mutex.Unlock()
+		if !str.corkPending || str.activationTimer == nil {
+			t.Fatalf("write not corked: corkPending=%v timer armed=%v", str.corkPending, str.activationTimer != nil)
+		}
+		return str.activationGen
+	}
+
+	for range sendStreamBurstMinWrites {
+		if _, err := str.Write(make([]byte, 32)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	drainOnce(t, str)
+	first := corkOnce()
+
+	// The blocking path parks until the packetizer takes the data, so drain
+	// alongside it.
+	done := make(chan error, 1)
+	go func() { _, err := str.Write(make([]byte, maxBufferedWriteSize+1)); done <- err }()
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("large write: %v", err)
+			}
+			drainOnce(t, str)
+			str.mutex.Lock()
+			armed := str.activationTimer != nil
+			str.mutex.Unlock()
+			if armed {
+				t.Fatal("cork timer still armed after the episode ended")
+			}
+			if second := corkOnce(); second == first {
+				t.Fatalf("the next cork reused generation %d, so it got no timer of its own", second)
+			}
+			return
+		default:
+			str.popStreamFrame(protocol.MaxPacketBufferSize, protocol.Version1)
+		}
+	}
+}
