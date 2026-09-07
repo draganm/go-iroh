@@ -15,11 +15,12 @@ import "github.com/tmc/go-iroh/internal/qng/internal/protocol"
 //	writeBuffer    appended by the buffered fast path
 //	dataForWriting the write currently blocked, newest
 //
-// Two rules keep that order true. The fast path appends only while no
-// blocking write holds writeActive, so its bytes cannot land between an older
-// write's staged bytes and the rest of that write. And canBufferStreamFrame
-// refuses to extend nextFrame while the buffer holds data, so a later write
-// cannot append bytes to nextFrame that are newer than buffered ones.
+// Two rules keep that order true. The fast path appends only while
+// dataForWriting is nil, so its bytes cannot land between an older write's
+// staged bytes and the rest of that write. And both sites that extend
+// nextFrame, canBufferStreamFrame and tryWriteAll, refuse while the buffer
+// holds data, so neither can put bytes in nextFrame that are newer than
+// buffered ones.
 
 const (
 	// sendStreamWriteBufferSize is the initial write buffer limit.
