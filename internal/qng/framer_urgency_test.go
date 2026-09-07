@@ -146,10 +146,70 @@ func TestFramerHandle0RTTRejectionDropsEveryUrgencyLevel(t *testing.T) {
 		f.AddStreamWithRetransmission(id, &schedStream{id: id, urgency: urgency, retransmits: 3})
 	}
 	f.Handle0RTTRejection()
+	// Assert the masks before draining, and before HasData, because neither
+	// observes them: the queues are empty either way, so a level left marked
+	// in use costs one wasted scan that the first Append then clears, leaving
+	// the frames below identical and the masks zero by the time they are read.
+	f.mutex.Lock()
+	streamMask, retransMask := f.streamMask, f.retransMask
+	f.mutex.Unlock()
+	if streamMask != 0 || retransMask != 0 {
+		t.Errorf("after 0-RTT rejection streamMask = %08b, retransMask = %08b, want 0 and 0", streamMask, retransMask)
+	}
 	if f.HasData() {
 		t.Error("framer has data after 0-RTT rejection")
 	}
 	if got := drainFramer(t, f); len(got) != 0 {
 		t.Errorf("framer sent %v after 0-RTT rejection, want nothing", got)
+	}
+}
+
+// drainFramerFixed drains for a fixed number of packets instead of stopping at
+// the first that yields nothing. A stream that moves down in urgency mid-drain
+// legitimately costs one barren packet -- the level it moves to has already
+// been passed in that scan -- so a drain that breaks on the first empty packet
+// stops before serving it.
+func drainFramerFixed(t *testing.T, f *framer, packets int) map[protocol.StreamID]int {
+	t.Helper()
+	got := make(map[protocol.StreamID]int)
+	for range packets {
+		_, single, hasSingle, streamFrames, _ := f.Append(nil, nil, 1000, monotime.Now(), protocol.Version1)
+		if hasSingle {
+			got[single.Frame.StreamID]++
+		}
+		for _, sf := range streamFrames {
+			got[sf.Frame.StreamID]++
+		}
+	}
+	return got
+}
+
+// TestFramerServesStreamAfterUrgencyChange covers a stream moving up, where
+// the same-pass `m |=` carries it. A stream moving down has only the mask to
+// carry it: the level it lands on sits below the one being scanned, so this
+// pass will not revisit it and the next pass finds it only if the bit is set.
+func TestFramerServesRetransmissionAfterUrgencyLowered(t *testing.T) {
+	f := newTestFramer()
+	str := &schedStream{id: 4, urgency: 5, retransmits: 3}
+	f.AddStreamWithRetransmission(4, str)
+	str.urgency = 0
+	if got := drainFramerFixed(t, f, 8)[4]; got != 3 {
+		t.Errorf("stream sent %d frames after moving down to urgency 0, want 3", got)
+	}
+}
+
+// A stream that changes priority to a level holding nothing else is reachable
+// only if UpdateStreamPriority marks that level in use. Its old queue entry is
+// discarded on sight, the generation having moved on, so the old level cannot
+// carry it either.
+func TestFramerServesStreamAfterPriorityUpdateToEmptyLevel(t *testing.T) {
+	f := newTestFramer()
+	str := &schedStream{id: 4, urgency: 0, remaining: 3}
+	f.AddActiveStream(4, str)
+	str.urgency = 5
+	str.generation++
+	f.UpdateStreamPriority(4)
+	if got := drainFramerFixed(t, f, 8)[4]; got != 3 {
+		t.Errorf("stream sent %d frames after moving to empty urgency 5, want 3", got)
 	}
 }
