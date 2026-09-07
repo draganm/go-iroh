@@ -187,6 +187,13 @@ The vendored quic-go fork in `internal/qng` was updated to upstream v0.62.0.
 That package is internal, so no exported API changed; the fork's own divergence
 from upstream is recorded in the package's own documentation.
 
+The bump costs a few percent of single-stream message rate. Measured against
+v0.1.1 on a quiet Linux host, medians of 15 interleaved runs are 2.5% lower at
+8 KiB messages, 3.4% at 32 bytes and 5.3% at 1 KiB. Packets and bytes per
+operation are unchanged, so the cost is per-packet CPU on the send path rather
+than extra traffic. Bulk throughput and the multi-stream and multi-connection
+scaling benchmarks show no regression.
+
 ### v0.1.1
 
 Two encoding changes and one struct field. Nothing was removed, and no exported
