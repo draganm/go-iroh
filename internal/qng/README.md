@@ -34,6 +34,41 @@ additions are intentionally kept in plainly named files and tests (`multipath_*`
 `observed_addr_*`, `qnt_*`, `retry_admission_test.go`) where possible, with
 small integration edits in the connection, packet, and transport-parameter paths.
 
+## Performance divergences
+
+The fork also edits the send path in place, for throughput rather than wire
+compatibility. These are the edits with no plainly named file of their own, so
+they are the ones `qngregen -bump` has to merge into whatever upstream did to
+the same lines. `framer.go` and `send_stream.go` carry most of them, and are
+the two files an upstream release is most likely to touch.
+
+- **Write buffer** (`send_stream_buffer.go`, plus a retry branch in
+  `send_stream.go`'s write loop). Upstream returns from `Write` only once the
+  data has been packetized or fits the single-packet `nextFrame`; the buffer
+  lets `Write` copy into stream-owned storage and return. One consequence is
+  worth knowing before merging: the retry branch sits ahead of the `nextFrame`
+  staging branch and takes anything up to `maxBufferedWriteSize`, while
+  `canBufferStreamFrame` stages at most `MaxPacketBufferSize`, so upstream's
+  staging path is no longer reachable from a plain `Write` — only from one
+  carrying a deadline or a write limiter, or when the buffer cannot grow.
+- **Burst detection and the cork** (`send_stream_burst.go`). A stream drained
+  mid-burst holds the next write for a short tail delay so the writes behind it
+  can fill a packet, rather than handing the packetizer a few bytes at a time.
+- **`writeFast`** (`send_stream.go`). Small writes append to the buffer under
+  the mutex alone, skipping the `writeOnce` channel round trip that
+  `WriteWithLimit` needs. It gives up `writeOnce`'s reporting of concurrent
+  `Write` misuse, which is documented at the function.
+- **`onConnectionSendWindowUpdated`** (`send_stream.go`). Wakes a stream that
+  is blocked on connection-level flow control, which upstream does not notify.
+- **MAX_DATA coalescing** (`framer.go`). MAX_DATA is folded into the framer
+  instead of being queued as an ordinary control frame.
+- **Single-frame hold-back** (`framer.go`). A packet carrying exactly one
+  STREAM frame, the common case, avoids allocating the frame slice.
+- **Urgency-level masks** (`framer.go`). Upstream v0.62 replaced one stream
+  queue with eight, one per RFC 9218 urgency level. `streamMask` and
+  `retransMask` record which levels hold data so `Append` scans only those,
+  rather than walking all eight every packet.
+
 ## Taking a new upstream release
 
 The fork is not a pristine copy of quic-go. Alongside the mechanical import

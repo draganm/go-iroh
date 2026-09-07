@@ -183,16 +183,21 @@ unexported, so no composite literal is affected; the one thing to know is that
 copying a `Map` by value now trips `go vet`'s copylocks check. Nothing in this
 module copied one, and the type has always been passed as `*relay.Map`.
 
-The vendored quic-go fork in `internal/qng` was updated to upstream v0.62.0.
-That package is internal, so no exported API changed; the fork's own divergence
-from upstream is recorded in the package's own documentation.
+The vendored quic-go fork in `internal/qng` was updated to upstream v0.62.0, by
+way of v0.61.0. That package is internal, so no exported API changed; the fork's
+own divergence from upstream is recorded in the package's own documentation.
 
-The bump costs a few percent of single-stream message rate. Measured against
-v0.1.1 on a quiet Linux host, medians of 15 interleaved runs are 2.5% lower at
-8 KiB messages, 3.4% at 32 bytes and 5.3% at 1 KiB. Packets and bytes per
-operation are unchanged, so the cost is per-packet CPU on the send path rather
-than extra traffic. Bulk throughput and the multi-stream and multi-connection
-scaling benchmarks show no regression.
+Single-stream message rate ends up a few percent below v0.1.1. Measured on a
+quiet Linux host, medians of 15 interleaved runs are 2.5% lower at 8 KiB
+messages, 3.4% at 32 bytes and 5.3% at 1 KiB. Read that as the residual across
+the whole of v0.2 rather than the price of an upstream release: both revendors
+cost something, and most of the first one was the fork's own buffered send path
+being dropped in the merge, which is a fork-maintenance loss and not upstream
+getting slower. v0.2 re-applies that path and recovers most of it. Packets and
+bytes per operation are unchanged, so what remains is per-packet CPU on the send
+path rather than extra traffic. Bulk throughput is unaffected, and the
+multi-stream and multi-connection scaling benchmarks improve, from the path MTU
+discovery change described above.
 
 ### v0.1.1
 

@@ -8,4 +8,7 @@
 // wire compatibility with Rust iroh, which README.md enumerates. The
 // upstream copyright and license are in NOTICE and LICENSE; the cmd/qngregen
 // command regenerates the copy from the module cache.
+//
+// The fork additionally edits the send path in place for throughput. Those
+// divergences are not wire compatibility, and README.md lists them separately.
 package quic
