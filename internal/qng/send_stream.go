@@ -536,7 +536,12 @@ func (s *SendStream) popNewStreamFrameForPacket(maxBytes protocol.ByteCount, v p
 
 	// if the stream is canceled, only data up to the reliable size needs to be sent
 	reliableOffset := s.reliableOffset()
-	limitedWrite := s.writeLimiter != nil && s.nextFrame == nil
+	// A limiter meters the WriteWithLimit call that installed it, and the frame
+	// below is built from that call's data only when nothing older is queued
+	// ahead of it. Bytes still in the write buffer belong to an earlier Write,
+	// so metering them would spend the limiter's credit on data it never saw,
+	// and a limiter that refused would set writeLimited and strand them.
+	limitedWrite := s.writeLimiter != nil && s.nextFrame == nil && s.bufferedWriteLen() == 0
 	var maxDataLen protocol.ByteCount
 	if s.nextFrameReserved {
 		maxDataLen = s.nextFrame.DataLen()
