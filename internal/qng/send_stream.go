@@ -187,6 +187,14 @@ func (s *SendStream) WriteWithLimit(p []byte, limiter func(maxBytes int) int) (i
 // or a limiter or a shutdown or a full buffer, falls through to the general path
 // unchanged.
 //
+// The dataForWriting check carries a second job. A WriteWithLimit call installs
+// writeLimiter for the length of its write, and bytes taken here would be
+// packetized under that limiter without ever having been offered to it. Nothing
+// tests writeLimiter in this function, and nothing needs to: a write holding a
+// limiter also holds dataForWriting, so the check above already refuses. It has
+// to be that check and not the active one -- a stream with a limited write
+// parked on it is still active, so !s.active refuses nothing here.
+//
 // One property is deliberately given up. writeOnce also catches concurrent Write
 // calls, which are not permitted, and TryWriteAll probes it without blocking for
 // the same reason; a write taken here is invisible to both. Concurrent writers
