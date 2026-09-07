@@ -137,6 +137,9 @@ func TestSendStreamWriteWithLimitIgnoresStagedBytes(t *testing.T) {
 	go func() { _, err := str.Write(big); done <- err }()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
+		if time.Now().After(deadline) {
+			t.Fatal("the write never staged anything in nextFrame")
+		}
 		str.mutex.Lock()
 		staged := str.nextFrame != nil
 		remaining := len(str.dataForWriting)
@@ -158,9 +161,6 @@ func TestSendStreamWriteWithLimitIgnoresStagedBytes(t *testing.T) {
 		f, _, _ := str.popStreamFrame(600, protocol.Version1)
 		if f.Frame != nil {
 			f.Frame.PutBack()
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the large write never returned")
 		}
 	}
 	if err := <-done; err != nil {
